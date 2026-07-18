@@ -1,5 +1,23 @@
 """
-db.py — Database layer (Postgres/Neon DB), auth, and email helper for the RFQ Pipeline app.
+db.py — Database layer, auth, and email helper for the RFQ Pipeline app.
+
+This version stores data in a Neon (managed Postgres) database instead of
+a local SQLite file. Everything else in the app (app.py) is unchanged —
+it still calls db.get_conn(), conn.execute(sql, params), conn.fetchone()/
+fetchall(), conn.commit(), conn.close() exactly like before. A small
+wrapper class translates that familiar sqlite-style API onto psycopg2.
+
+SETUP
+-----
+1. pip install psycopg2-binary
+2. Create a project at https://neon.tech and copy its connection string
+   (Dashboard -> Connection Details). It looks like:
+       postgresql://user:password@ep-xxxx.neon.tech/dbname?sslmode=require
+3. Provide that connection string to this app via ONE of:
+       - an environment variable:      DATABASE_URL=postgresql://...
+       - a Streamlit secret:           .streamlit/secrets.toml
+                                        DATABASE_URL = "postgresql://..."
+   The app checks st.secrets first, then the environment variable.
 """
 
 import os
@@ -9,16 +27,16 @@ import smtplib
 import ssl
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from datetime import datetime
-import psycopg2
-from psycopg2.extras import RealDictCursor
+from datetime import datetime, timedelta
 
-# Neon Database Connection String (set in system environment variables or .env)
-# Example format: postgresql://user:password@subdomain.neon.tech/dbname?sslmode=require
-DATABASE_URL = os.environ.get(
-    "NEON_DATABASE_URL", 
-    "postgresql://localhost/rfq_pipeline"  # Local fallback for development
-)
+import psycopg2
+import psycopg2.extras
+import psycopg2.pool
+
+try:
+    import streamlit as st
+except ImportError:  # db.py can still be imported/tested outside Streamlit
+    st = None
 
 UPLOAD_DIR = os.path.join(os.path.dirname(__file__), "uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
@@ -53,7 +71,7 @@ ROLES = {
 RFQ_CREATOR_ROLES = {"admin", "sales"}
 
 STAGES = [
-    {"id": "received",   "label": "Received",           "color": "#5B7088"},
+    {"id": "received",   "label": "Received",          "color": "#5B7088"},
     {"id": "estimating", "label": "Estimating",         "color": "#2C8C99"},
     {"id": "presale",    "label": "Pre-Sale Pricing",   "color": "#3D6FA8"},
     {"id": "review",     "label": "Management Review",  "color": "#1F7A5C"},
@@ -94,140 +112,259 @@ def verify_password(password, stored_hash):
 
 
 # ---------------------------------------------------------------------------
-# DB connection & schema
+# Neon / Postgres connection handling
 # ---------------------------------------------------------------------------
 
+def _get_database_url():
+    """Look for the Neon connection string in Streamlit secrets first, then env."""
+    if st is not None:
+        try:
+            if "DATABASE_URL" in st.secrets and st.secrets["DATABASE_URL"].strip():
+                return st.secrets["DATABASE_URL"].strip()
+        except Exception:
+            pass  # no secrets.toml present — fall through to env var
+    url = os.environ.get("DATABASE_URL", "").strip()
+    if not url:
+        raise RuntimeError(
+            "No Neon database connection string found (DATABASE_URL is missing or blank). "
+            "Set the DATABASE_URL environment variable, or add it to .streamlit/secrets.toml as "
+            'DATABASE_URL = "postgresql://user:password@ep-xxxx.neon.tech/dbname?sslmode=require" '
+            "(copy the connection string from your Neon project dashboard). "
+            "If you're running in Docker, double check the variable is actually reaching the "
+            "container — e.g. `docker exec <container> printenv DATABASE_URL`."
+        )
+    return url
+
+
+_pool = None
+
+
+def _get_pool():
+    global _pool
+    if _pool is None:
+        dsn = _get_database_url()
+        # min 1, max 10 pooled connections — plenty for a Streamlit app.
+        _pool = psycopg2.pool.ThreadedConnectionPool(1, 10, dsn=dsn)
+    return _pool
+
+
+class _CursorResult:
+    """Minimal wrapper so callers can keep using fetchone()/fetchall()."""
+
+    def __init__(self, cursor):
+        self._cursor = cursor
+
+    def fetchone(self):
+        return self._cursor.fetchone()
+
+    def fetchall(self):
+        return self._cursor.fetchall()
+
+    @property
+    def rowcount(self):
+        return self._cursor.rowcount
+
+
+class PgConnection:
+    """
+    Thin adapter over a pooled psycopg2 connection so the rest of the app
+    can keep using the sqlite3-style pattern it was written with:
+
+        conn = db.get_conn()
+        row = conn.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
+        conn.commit()
+        conn.close()
+
+    - '?' placeholders are translated to psycopg2's '%s'
+    - rows come back as dict-like RealDictRow objects, so row["col"] and
+      dict(row) both work exactly like they did with sqlite3.Row
+    - close() returns the connection to the pool instead of closing the
+      socket, and rolls back any uncommitted work as a safety net
+    """
+
+    def __init__(self, raw_conn, pool):
+        self._conn = raw_conn
+        self._pool = pool
+
+    def execute(self, query, params=()):
+        query = query.replace("?", "%s")
+        cur = self._conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(query, params)
+        return _CursorResult(cur)
+
+    def commit(self):
+        self._conn.commit()
+
+    def rollback(self):
+        self._conn.rollback()
+
+    def close(self):
+        try:
+            self._conn.rollback()  # no-op if everything was already committed
+        except Exception:
+            pass
+        self._pool.putconn(self._conn)
+
+
 def get_conn():
-    """
-    Establishes and returns a connection to your Neon database using psycopg2.
-    Using RealDictCursor causes rows to behave like python dictionaries.
-    """
-    conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
-    return conn
+    pool = _get_pool()
+    raw_conn = pool.getconn()
+    return PgConnection(raw_conn, pool)
 
 
 def init_db():
     conn = get_conn()
-    cur = conn.cursor()
 
-    cur.execute("""
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS users (
-            id VARCHAR(50) PRIMARY KEY,
-            username VARCHAR(100) UNIQUE,
-            full_name VARCHAR(255),
-            email VARCHAR(255),
-            role VARCHAR(50),
-            password_hash VARCHAR(255),
-            active BOOLEAN DEFAULT TRUE,
-            created_at VARCHAR(100)
+            id TEXT PRIMARY KEY,
+            username TEXT UNIQUE,
+            full_name TEXT,
+            email TEXT,
+            role TEXT,
+            password_hash TEXT,
+            active INTEGER DEFAULT 1,
+            created_at TEXT
         )
     """)
 
-    cur.execute("""
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS user_roles (
-            id VARCHAR(50) PRIMARY KEY,
-            user_id VARCHAR(50),
-            role VARCHAR(50),
+            id TEXT PRIMARY KEY,
+            seq SERIAL,
+            user_id TEXT,
+            role TEXT,
             UNIQUE(user_id, role)
         )
     """)
 
-    cur.execute("""
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS rfqs (
-            id VARCHAR(50) PRIMARY KEY,
-            code VARCHAR(50),
-            name VARCHAR(255),
-            customer VARCHAR(255),
-            priority VARCHAR(50),
-            stage VARCHAR(50),
-            created_by VARCHAR(255),
-            created_at VARCHAR(100),
-            man_days_estimator_id VARCHAR(50),
-            irm_estimator_id VARCHAR(50),
-            presale_id VARCHAR(50),
-            quote_amount DOUBLE PRECISION,
-            quote_valid_until VARCHAR(100),
+            id TEXT PRIMARY KEY,
+            code TEXT,
+            name TEXT,
+            customer TEXT,
+            priority TEXT,
+            stage TEXT,
+            created_by TEXT,
+            created_at TEXT,
+            man_days_estimator_id TEXT,
+            irm_estimator_id TEXT,
+            presale_id TEXT,
+            quote_amount REAL,
+            quote_valid_until TEXT,
             quote_notes TEXT,
-            decision_outcome VARCHAR(50),
+            decision_outcome TEXT,
             decision_comment TEXT,
-            decision_at VARCHAR(100)
+            decision_at TEXT
         )
     """)
 
-    cur.execute("""
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS history (
-            id VARCHAR(50) PRIMARY KEY,
-            rfq_id VARCHAR(50),
-            stage VARCHAR(50),
-            actor VARCHAR(255),
+            id TEXT PRIMARY KEY,
+            rfq_id TEXT,
+            stage TEXT,
+            actor TEXT,
             note TEXT,
-            ts VARCHAR(100)
+            ts TEXT
         )
     """)
 
-    cur.execute("""
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS files (
-            id VARCHAR(50) PRIMARY KEY,
-            rfq_id VARCHAR(50),
-            kind VARCHAR(50),
-            filename VARCHAR(255),
-            stored_path VARCHAR(512),
-            uploaded_by VARCHAR(255),
-            uploaded_at VARCHAR(100)
+            id TEXT PRIMARY KEY,
+            rfq_id TEXT,
+            kind TEXT,
+            filename TEXT,
+            stored_path TEXT,
+            uploaded_by TEXT,
+            uploaded_at TEXT
         )
     """)
 
-    cur.execute("""
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS email_log (
-            id VARCHAR(50) PRIMARY KEY,
-            rfq_id VARCHAR(50),
-            to_email VARCHAR(255),
-            subject VARCHAR(255),
-            status VARCHAR(50),
+            id TEXT PRIMARY KEY,
+            rfq_id TEXT,
+            to_email TEXT,
+            subject TEXT,
+            status TEXT,
             error TEXT,
-            sent_at VARCHAR(100)
+            sent_at TEXT
         )
     """)
 
-    cur.execute("""
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS settings (
-            key VARCHAR(100) PRIMARY KEY,
+            key TEXT PRIMARY KEY,
             value TEXT
         )
     """)
 
     conn.commit()
 
+    # --- Migration: normalize users.active to INTEGER ---
+    # (an earlier/alternate deployment may have created this column as BOOLEAN;
+    # the rest of the app compares it with active=1 / active=0, so convert it)
+    active_col = conn.execute("""
+        SELECT data_type FROM information_schema.columns
+        WHERE table_name='users' AND column_name='active'
+    """).fetchone()
+    if active_col and active_col["data_type"] == "boolean":
+        conn.execute("ALTER TABLE users ALTER COLUMN active DROP DEFAULT")
+        conn.execute("""
+            ALTER TABLE users ALTER COLUMN active TYPE INTEGER
+            USING (CASE WHEN active THEN 1 ELSE 0 END)
+        """)
+        conn.execute("ALTER TABLE users ALTER COLUMN active SET DEFAULT 1")
+        conn.commit()
+
+    # --- Migration: add `seq` to user_roles if this table pre-dates that column ---
+    # (older deployments of this app created user_roles without a `seq` column;
+    # ORDER BY seq needs it to exist, so add it on the fly if missing)
+    seq_col = conn.execute("""
+        SELECT column_name FROM information_schema.columns
+        WHERE table_name='user_roles' AND column_name='seq'
+    """).fetchone()
+    if not seq_col:
+        conn.execute("ALTER TABLE user_roles ADD COLUMN seq SERIAL")
+        conn.commit()
+
     # --- Migration: backfill user_roles from the legacy single `role` column ---
     # Covers upgrades from the previous single-role version of this app.
     # Any user who has a role set on the old column but no rows yet in
     # user_roles gets that role copied over automatically.
-    cur.execute("SELECT id, role FROM users WHERE role IS NOT NULL AND role != ''")
-    legacy_users = cur.fetchall()
+    legacy_users = conn.execute(
+        "SELECT id, role FROM users WHERE role IS NOT NULL AND role != ''"
+    ).fetchall()
     for u in legacy_users:
-        cur.execute("SELECT COUNT(*) AS c FROM user_roles WHERE user_id=%s", (u["id"],))
-        has_roles = cur.fetchone()["c"]
+        has_roles = conn.execute(
+            "SELECT COUNT(*) AS c FROM user_roles WHERE user_id=?", (u["id"],)
+        ).fetchone()["c"]
         if has_roles == 0:
-            cur.execute("INSERT INTO user_roles (id, user_id, role) VALUES (%s,%s,%s) ON CONFLICT DO NOTHING",
-                        (new_id("ur"), u["id"], u["role"]))
+            conn.execute(
+                "INSERT INTO user_roles (id, user_id, role) VALUES (?,?,?) "
+                "ON CONFLICT (user_id, role) DO NOTHING",
+                (new_id("ur"), u["id"], u["role"]),
+            )
     conn.commit()
 
     # Seed default admin if no users exist
-    cur.execute("SELECT COUNT(*) AS c FROM users")
-    if cur.fetchone()["c"] == 0:
+    count_row = conn.execute("SELECT COUNT(*) AS c FROM users").fetchone()
+    if count_row["c"] == 0:
         admin_id = new_id("u")
-        cur.execute("""
+        conn.execute("""
             INSERT INTO users (id, username, full_name, email, role, password_hash, active, created_at)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+            VALUES (?,?,?,?,?,?,?,?)
         """, (
             admin_id, DEFAULT_ADMIN_USERNAME, "Administrator", "admin@example.com",
-            "admin", hash_password(DEFAULT_ADMIN_PASSWORD), True, datetime.now().isoformat()
+            "admin", hash_password(DEFAULT_ADMIN_PASSWORD), 1, datetime.now().isoformat()
         ))
-        cur.execute("INSERT INTO user_roles (id, user_id, role) VALUES (%s,%s,%s)",
-                    (new_id("ur"), admin_id, "admin"))
+        conn.execute("INSERT INTO user_roles (id, user_id, role) VALUES (?,?,?)",
+                     (new_id("ur"), admin_id, "admin"))
         conn.commit()
 
-    cur.close()
     conn.close()
 
 
@@ -237,21 +374,16 @@ def init_db():
 
 def get_setting(key, default=""):
     conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT value FROM settings WHERE key=%s", (key,))
-    row = cur.fetchone()
-    cur.close()
+    row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
     conn.close()
     return row["value"] if row else default
 
 
 def set_setting(key, value):
     conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("INSERT INTO settings (key, value) VALUES (%s,%s) "
-                 "ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value", (key, value))
+    conn.execute("INSERT INTO settings (key, value) VALUES (?,?) "
+                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
     conn.commit()
-    cur.close()
     conn.close()
 
 
@@ -265,10 +397,9 @@ def _attach_roles(user_dict):
     if user_dict is None:
         return None
     conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT role FROM user_roles WHERE user_id=%s ORDER BY id ASC", (user_dict["id"],))
-    rows = cur.fetchall()
-    cur.close()
+    rows = conn.execute(
+        "SELECT role FROM user_roles WHERE user_id=? ORDER BY seq ASC", (user_dict["id"],)
+    ).fetchall()
     conn.close()
     roles = [r["role"] for r in rows]
     if not roles and user_dict.get("role"):
@@ -284,14 +415,11 @@ def user_has_role(user_dict, role):
 
 def fetch_users(active_only=False):
     conn = get_conn()
-    cur = conn.cursor()
     q = "SELECT * FROM users"
     if active_only:
-        q += " WHERE active=TRUE"
+        q += " WHERE active=1"
     q += " ORDER BY full_name ASC"
-    cur.execute(q)
-    rows = [dict(r) for r in cur.fetchall()]
-    cur.close()
+    rows = [dict(r) for r in conn.execute(q).fetchall()]
     conn.close()
     return [_attach_roles(u) for u in rows]
 
@@ -302,20 +430,14 @@ def fetch_users_by_role(role, active_only=True):
 
 def get_user_by_username(username):
     conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM users WHERE username=%s", (username,))
-    row = cur.fetchone()
-    cur.close()
+    row = conn.execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
     conn.close()
     return _attach_roles(dict(row)) if row else None
 
 
 def get_user_by_id(user_id):
     conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM users WHERE id=%s", (user_id,))
-    row = cur.fetchone()
-    cur.close()
+    row = conn.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
     conn.close()
     return _attach_roles(dict(row)) if row else None
 
@@ -323,20 +445,21 @@ def get_user_by_id(user_id):
 def set_user_roles(user_id, roles):
     """Replace the full set of roles for a user with the given list."""
     conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM user_roles WHERE user_id=%s", (user_id,))
+    conn.execute("DELETE FROM user_roles WHERE user_id=?", (user_id,))
     seen = set()
     for role in roles:
         if role in seen:
             continue
         seen.add(role)
-        cur.execute("INSERT INTO user_roles (id, user_id, role) VALUES (%s,%s,%s) ON CONFLICT DO NOTHING",
-                    (new_id("ur"), user_id, role))
+        conn.execute(
+            "INSERT INTO user_roles (id, user_id, role) VALUES (?,?,?) "
+            "ON CONFLICT (user_id, role) DO NOTHING",
+            (new_id("ur"), user_id, role),
+        )
     # Keep the legacy `role` column in sync (first role) so any old code path still works.
     primary = roles[0] if roles else None
-    cur.execute("UPDATE users SET role=%s WHERE id=%s", (primary, user_id))
+    conn.execute("UPDATE users SET role=? WHERE id=?", (primary, user_id))
     conn.commit()
-    cur.close()
     conn.close()
 
 
@@ -345,25 +468,26 @@ def create_user(username, full_name, email, roles, password):
     if isinstance(roles, str):
         roles = [roles]
     conn = get_conn()
-    cur = conn.cursor()
     try:
         user_id = new_id("u")
         primary = roles[0] if roles else None
-        cur.execute("""
+        conn.execute("""
             INSERT INTO users (id, username, full_name, email, role, password_hash, active, created_at)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+            VALUES (?,?,?,?,?,?,?,?)
         """, (user_id, username.strip(), full_name.strip(), email.strip(), primary,
-              hash_password(password), True, datetime.now().isoformat()))
+              hash_password(password), 1, datetime.now().isoformat()))
         for role in dict.fromkeys(roles):  # de-dupe, preserve order
-            cur.execute("INSERT INTO user_roles (id, user_id, role) VALUES (%s,%s,%s) ON CONFLICT DO NOTHING",
-                        (new_id("ur"), user_id, role))
+            conn.execute(
+                "INSERT INTO user_roles (id, user_id, role) VALUES (?,?,?) "
+                "ON CONFLICT (user_id, role) DO NOTHING",
+                (new_id("ur"), user_id, role),
+            )
         conn.commit()
         return True, "User created."
     except psycopg2.IntegrityError:
         conn.rollback()
         return False, "Username already exists."
     finally:
-        cur.close()
         conn.close()
 
 
@@ -371,22 +495,18 @@ def update_user(user_id, full_name, email, roles, active):
     if isinstance(roles, str):
         roles = [roles]
     conn = get_conn()
-    cur = conn.cursor()
     primary = roles[0] if roles else None
-    cur.execute("UPDATE users SET full_name=%s, email=%s, role=%s, active=%s WHERE id=%s",
-                 (full_name, email, primary, active, user_id))
+    conn.execute("UPDATE users SET full_name=?, email=?, role=?, active=? WHERE id=?",
+                 (full_name, email, primary, 1 if active else 0, user_id))
     conn.commit()
-    cur.close()
     conn.close()
     set_user_roles(user_id, roles)
 
 
 def reset_password(user_id, new_password):
     conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("UPDATE users SET password_hash=%s WHERE id=%s", (hash_password(new_password), user_id))
+    conn.execute("UPDATE users SET password_hash=? WHERE id=?", (hash_password(new_password), user_id))
     conn.commit()
-    cur.close()
     conn.close()
 
 
@@ -407,10 +527,7 @@ def authenticate(username, password):
 
 def next_code():
     conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT code FROM rfqs")
-    rows = cur.fetchall()
-    cur.close()
+    rows = conn.execute("SELECT code FROM rfqs").fetchall()
     conn.close()
     nums = []
     for r in rows:
@@ -422,24 +539,23 @@ def next_code():
     return f"RFQ-2026-{nxt:03d}"
 
 
-def add_history(cur, rfq_id, stage, actor, note):
-    cur.execute("INSERT INTO history VALUES (%s,%s,%s,%s,%s,%s)",
+def add_history(conn, rfq_id, stage, actor, note):
+    conn.execute("INSERT INTO history VALUES (?,?,?,?,?,?)",
                  (new_id("h"), rfq_id, stage, actor, note, datetime.now().isoformat()))
 
 
 def create_rfq(name, customer, priority, created_by_user, man_days_est_id, irm_est_id, presale_id, files):
     """
-    files: list of (kind, UploadedFile) tuples, kind in {'rfq_doc'}
+    files: list of UploadedFile objects (kind is always 'rfq_doc' for these)
     Returns the new rfq dict.
     """
     conn = get_conn()
-    cur = conn.cursor()
     rfq_id = new_id("rfq")
     code = next_code()
-    cur.execute("""
+    conn.execute("""
         INSERT INTO rfqs (id, code, name, customer, priority, stage, created_by, created_at,
                            man_days_estimator_id, irm_estimator_id, presale_id)
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?)
     """, (rfq_id, code, name, customer, priority, "received", created_by_user["full_name"],
           datetime.now().isoformat(), man_days_est_id, irm_est_id, presale_id))
 
@@ -453,9 +569,8 @@ def create_rfq(name, customer, priority, created_by_user, man_days_est_id, irm_e
     note = "RFQ logged."
     if assigned_names:
         note += " Assigned: " + ", ".join(assigned_names) + "."
-    add_history(cur, rfq_id, "received", created_by_user["full_name"], note)
+    add_history(conn, rfq_id, "received", created_by_user["full_name"], note)
     conn.commit()
-    cur.close()
     conn.close()
 
     for uploaded_file in files:
@@ -466,29 +581,22 @@ def create_rfq(name, customer, priority, created_by_user, man_days_est_id, irm_e
 
 def fetch_rfq(rfq_id):
     conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM rfqs WHERE id=%s", (rfq_id,))
-    row = cur.fetchone()
+    row = conn.execute("SELECT * FROM rfqs WHERE id=?", (rfq_id,)).fetchone()
     if not row:
-        cur.close()
         conn.close()
         return None
     rfq = dict(row)
-    cur.execute("SELECT * FROM history WHERE rfq_id=%s ORDER BY ts ASC", (rfq_id,))
-    rfq["history"] = [dict(h) for h in cur.fetchall()]
-    cur.execute("SELECT * FROM files WHERE rfq_id=%s ORDER BY uploaded_at ASC", (rfq_id,))
-    rfq["files"] = [dict(f) for f in cur.fetchall()]
-    cur.close()
+    rfq["history"] = [dict(h) for h in conn.execute(
+        "SELECT * FROM history WHERE rfq_id=? ORDER BY ts ASC", (rfq_id,)).fetchall()]
+    rfq["files"] = [dict(f) for f in conn.execute(
+        "SELECT * FROM files WHERE rfq_id=? ORDER BY uploaded_at ASC", (rfq_id,)).fetchall()]
     conn.close()
     return rfq
 
 
 def fetch_rfqs():
     conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT id FROM rfqs ORDER BY created_at DESC")
-    rows = cur.fetchall()
-    cur.close()
+    rows = conn.execute("SELECT * FROM rfqs ORDER BY created_at DESC").fetchall()
     conn.close()
     return [fetch_rfq(r["id"]) for r in rows]
 
@@ -501,23 +609,19 @@ def save_uploaded_file(rfq_id, kind, uploaded_file, uploaded_by):
     with open(dest_path, "wb") as f:
         f.write(uploaded_file.getbuffer())
     conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("INSERT INTO files VALUES (%s,%s,%s,%s,%s,%s,%s)", (
+    conn.execute("INSERT INTO files VALUES (?,?,?,?,?,?,?)", (
         new_id("f"), rfq_id, kind, uploaded_file.name, dest_path, uploaded_by, datetime.now().isoformat()
     ))
     conn.commit()
-    cur.close()
     conn.close()
 
 
 def submit_man_days_file(rfq_id, uploaded_file, actor_name):
     """Estimator uploads their Man Days estimate as a file (no numeric value stored)."""
     conn = get_conn()
-    cur = conn.cursor()
-    _mark_estimating(cur, rfq_id)
-    add_history(cur, rfq_id, "estimating", actor_name, f"Man Days estimate file uploaded: {uploaded_file.name}.")
+    _mark_estimating(conn, rfq_id)
+    add_history(conn, rfq_id, "estimating", actor_name, f"Man Days estimate file uploaded: {uploaded_file.name}.")
     conn.commit()
-    cur.close()
     conn.close()
     save_uploaded_file(rfq_id, "man_days_file", uploaded_file, actor_name)
     _advance_if_estimates_complete(rfq_id)
@@ -528,11 +632,9 @@ def submit_man_days_file(rfq_id, uploaded_file, actor_name):
 def submit_irm_file(rfq_id, uploaded_file, actor_name):
     """Estimator uploads their IRM estimate as a file (no numeric value stored)."""
     conn = get_conn()
-    cur = conn.cursor()
-    _mark_estimating(cur, rfq_id)
-    add_history(cur, rfq_id, "estimating", actor_name, f"IRM estimate file uploaded: {uploaded_file.name}.")
+    _mark_estimating(conn, rfq_id)
+    add_history(conn, rfq_id, "estimating", actor_name, f"IRM estimate file uploaded: {uploaded_file.name}.")
     conn.commit()
-    cur.close()
     conn.close()
     save_uploaded_file(rfq_id, "irm_file", uploaded_file, actor_name)
     _advance_if_estimates_complete(rfq_id)
@@ -540,20 +642,16 @@ def submit_irm_file(rfq_id, uploaded_file, actor_name):
     return notify_presale_of_estimate(rfq, "IRM")
 
 
-def _mark_estimating(cur, rfq_id):
+def _mark_estimating(conn, rfq_id):
     """Move a freshly-created RFQ into 'estimating' as soon as the first estimate file comes in."""
-    cur.execute("SELECT stage FROM rfqs WHERE id=%s", (rfq_id,))
-    row = cur.fetchone()
+    row = conn.execute("SELECT stage FROM rfqs WHERE id=?", (rfq_id,)).fetchone()
     if row["stage"] == "received":
-        cur.execute("UPDATE rfqs SET stage='estimating' WHERE id=%s", (rfq_id,))
+        conn.execute("UPDATE rfqs SET stage='estimating' WHERE id=?", (rfq_id,))
 
 
 def has_file_kind(rfq_id, kind):
     conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT COUNT(*) AS c FROM files WHERE rfq_id=%s AND kind=%s", (rfq_id, kind))
-    row = cur.fetchone()
-    cur.close()
+    row = conn.execute("SELECT COUNT(*) AS c FROM files WHERE rfq_id=? AND kind=?", (rfq_id, kind)).fetchone()
     conn.close()
     return row["c"] > 0
 
@@ -561,33 +659,26 @@ def has_file_kind(rfq_id, kind):
 def _advance_if_estimates_complete(rfq_id):
     """Once BOTH a Man Days file and an IRM file have been uploaded, move the RFQ on to Pre-Sale."""
     conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT stage FROM rfqs WHERE id=%s", (rfq_id,))
-    row = cur.fetchone()
+    row = conn.execute("SELECT stage FROM rfqs WHERE id=?", (rfq_id,)).fetchone()
     if row["stage"] != "estimating":
-        cur.close()
         conn.close()
         return
     has_md = has_file_kind(rfq_id, "man_days_file")
     has_irm = has_file_kind(rfq_id, "irm_file")
     if has_md and has_irm:
-        cur.execute("UPDATE rfqs SET stage='presale' WHERE id=%s", (rfq_id,))
-        add_history(cur, rfq_id, "presale", "System", "Both estimate files uploaded. Sent to Pre-Sale for pricing.")
+        conn.execute("UPDATE rfqs SET stage='presale' WHERE id=?", (rfq_id,))
+        add_history(conn, rfq_id, "presale", "System", "Both estimate files uploaded. Sent to Pre-Sale for pricing.")
         conn.commit()
-    cur.close()
     conn.close()
 
 
 def submit_quote(rfq_id, amount, valid_days, notes, quote_file, actor_name):
-    from datetime import timedelta
     conn = get_conn()
-    cur = conn.cursor()
     valid_until = (datetime.now() + timedelta(days=valid_days)).isoformat()
-    cur.execute("UPDATE rfqs SET quote_amount=%s, quote_valid_until=%s, quote_notes=%s, stage='review' WHERE id=%s",
+    conn.execute("UPDATE rfqs SET quote_amount=?, quote_valid_until=?, quote_notes=?, stage='review' WHERE id=?",
                  (amount, valid_until, notes, rfq_id))
-    add_history(cur, rfq_id, "review", actor_name, f"Quote prepared: ${amount:,.0f}. Sent to Management for review.")
+    add_history(conn, rfq_id, "review", actor_name, f"Quote prepared: ${amount:,.0f}. Sent to Management for review.")
     conn.commit()
-    cur.close()
     conn.close()
     if quote_file is not None:
         save_uploaded_file(rfq_id, "quote", quote_file, actor_name)
@@ -597,15 +688,13 @@ def submit_quote(rfq_id, amount, valid_days, notes, quote_file, actor_name):
 
 def record_decision(rfq_id, outcome, comment, actor_name):
     conn = get_conn()
-    cur = conn.cursor()
     new_stage = "closed" if outcome in ("approved", "rejected") else "review"
-    cur.execute("UPDATE rfqs SET decision_outcome=%s, decision_comment=%s, decision_at=%s, stage=%s WHERE id=%s",
+    conn.execute("UPDATE rfqs SET decision_outcome=?, decision_comment=?, decision_at=?, stage=? WHERE id=?",
                  (outcome, comment, datetime.now().isoformat(), new_stage, rfq_id))
     label = {"approved": "Approved", "rejected": "Rejected", "changes": "Changes requested"}[outcome]
     note = label + (f". {comment}" if comment else ".")
-    add_history(cur, rfq_id, new_stage, actor_name, note)
+    add_history(conn, rfq_id, new_stage, actor_name, note)
     conn.commit()
-    cur.close()
     conn.close()
 
 
@@ -624,6 +713,7 @@ def send_email(to_email, subject, body_html):
     Configure once in the Admin > Email Settings page:
       - smtp_email: your Gmail address
       - smtp_app_password: a 16-character Gmail App Password
+        (Google Account -> Security -> 2-Step Verification -> App Passwords)
     """
     sender_email = get_setting("smtp_email")
     app_password = get_setting("smtp_app_password")
@@ -655,12 +745,10 @@ def send_email(to_email, subject, body_html):
 
 def log_email(rfq_id, to_email, subject, status, error=""):
     conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("INSERT INTO email_log VALUES (%s,%s,%s,%s,%s,%s,%s)", (
+    conn.execute("INSERT INTO email_log VALUES (?,?,?,?,?,?,?)", (
         new_id("e"), rfq_id, to_email, subject, status, error, datetime.now().isoformat()
     ))
     conn.commit()
-    cur.close()
     conn.close()
 
 
